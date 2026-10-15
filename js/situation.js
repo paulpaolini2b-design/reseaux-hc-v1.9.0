@@ -8,6 +8,10 @@
  * puis enregistrée comme une image libre (magasin `fonds`, voir images.js) : elle reste disponible hors ligne et sort
  * à l'export PDF / PNG comme toute image. Seules la création et le changement d'échelle demandent une connexion.
  *
+ * v1.9.1 (H-380) : HTTP 400 du service — message et URL de la tuile en cause conservés (corps de la réponse lu) ; une tuile
+ * refusée (400) est laissée en blanc comme une tuile absente ; si TOUTES les tuiles sont refusées, la carte est redemandée
+ * un niveau plus bas (emprise au sol identique, définition réduite de moitié), au plus RECULS_ZOOM_MAX fois.
+ *
  * L'objet est une image (`type: 'image'`) portant `situation { lat, lon, zoom, diametre_mm, source, date }` : taille,
  * rotation, opacité, rognage et calque sont ceux des images ; symboles.js ajoute le rond rouge (point GPS, au centre de
  * l'image entière) et le cadre. Le point GPS est au centre exact de l'image entière, quel que soit le rognage.
@@ -126,6 +130,24 @@ export function inversionProbable(lat, lon) {
   return !dansMetropole(lat, lon) && dansMetropole(lon, lat);
 }
 
+/* v1.9.1 (H-380) — nombre maximal de reculs de niveau quand toutes les tuiles sont refusées (400). Valeur propre à
+ * l'application, NON NORMATIVE. */
+const RECULS_ZOOM_MAX = 2;
+const ZOOM_RECUL_MIN = 8;
+
+/* Texte utile d'une réponse d'erreur du service (rapport d'exception OGC en XML ou texte brut) : balises retirées,
+ * 160 caractères au plus. Module pur. */
+export function detailService(corps) {
+  const t = String(corps || '').replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+  return t.length > 160 ? t.slice(0, 160) + '…' : t;
+}
+
+/* Extrait « niveau / ligne / colonne » d'une URL de tuile, pour le message d'erreur. Module pur. */
+export function reperesTuile(url) {
+  const g = (k) => { const m = new RegExp('[?&]' + k + '=([^&]*)').exec(String(url || '')); return m ? m[1] : '?'; };
+  return 'niveau ' + g('TILEMATRIX') + ', ligne ' + g('TILEROW') + ', colonne ' + g('TILECOL');
+}
+
 /* Charge une tuile. Retourne une ImageBitmap, ou null si le service répond 404 (tuile absente de la pyramide : mer au
  * large, point hors couverture). Un 404 est d'abord redemandé une fois en contournant le cache HTTP du navigateur (un
  * 404 ancien peut y avoir été conservé). Lève une erreur typée pour les autres cas. Exportée pour les essais. */
@@ -133,16 +155,25 @@ export async function chargerTuile(url, signal) {
   let rep = await fetch(url, { mode: 'cors', signal, cache: 'default' });
   if (rep.status === 404) rep = await fetch(url, { mode: 'cors', signal, cache: 'reload' });
   if (rep.status === 404) return null;
-  if (!rep.ok) { const e = new Error('HTTP ' + rep.status); e.code = 'http'; e.status = rep.status; e.url = url; throw e; }
+  if (!rep.ok) {
+    let detail = '';
+    try { detail = detailService(await rep.text()); } catch (_) { /* corps illisible : sans détail */ }
+    const e = new Error('HTTP ' + rep.status); e.code = 'http'; e.status = rep.status; e.url = url; e.detail = detail; throw e;
+  }
   const blob = await rep.blob();
   if (!/^image\//.test(blob.type || 'image/')) { const e = new Error('réponse non image'); e.code = 'format'; e.url = url; throw e; }
   return await createImageBitmap(blob);
 }
 
-/* Message d'erreur selon la cause : seule une panne réseau ou un délai renvoie à la connexion. */
-function messageErreur(e) {
+/* Message d'erreur selon la cause : seule une panne réseau ou un délai renvoie à la connexion ; une erreur 4xx n'est pas
+ * passagère (requête refusée) : « réessayer plus tard » n'est proposé que pour les erreurs 5xx. */
+export function messageErreur(e) {
   if (e && e.name === 'AbortError') return 'carte IGN : délai dépassé — vérifier la connexion';
-  if (e && e.code === 'http') return 'service IGN en erreur (HTTP ' + e.status + ') — réessayer plus tard';
+  if (e && e.code === 'http') {
+    const det = e.detail ? ' — « ' + e.detail + ' »' : '';
+    if (e.status >= 400 && e.status < 500) return 'requête refusée par le service IGN (HTTP ' + e.status + ', ' + reperesTuile(e.url) + ')' + det;
+    return 'service IGN en erreur (HTTP ' + e.status + ') — réessayer plus tard' + det;
+  }
   if (e && e.code === 'format') return 'service IGN : réponse inattendue (pas une image) — réessayer plus tard';
   return 'carte IGN inaccessible (réseau : ' + ((e && e.message) || e) + ') — vérifier la connexion';
 }
@@ -157,21 +188,36 @@ export async function genererCarteSituation(gps, zoom = null, dimensions = null)
   if (inversionProbable(g.lat, g.lon)) throw new Error('point GPS « ' + g.lat + ', ' + g.lon + ' » : latitude et longitude semblent inversées — saisir la latitude en premier (ex. 42.69, 9.45) dans Informations de l’affaire');
   if (typeof navigator !== 'undefined' && navigator.onLine === false) throw new Error('pas de connexion : la carte IGN se télécharge une fois, puis reste disponible hors ligne');
   const C = K();
-  const z = Math.min(C.zoom_max, Math.max(dimensions ? 0 : C.zoom_min, Math.round(zoom ?? C.zoom_defaut)));
-  const L = dimensions ? Math.round(dimensions.largeurPx) : C.largeur_px, H = dimensions ? Math.round(dimensions.hauteurPx) : C.hauteur_px;
-  const tuiles = tuilesFenetre(g.lat, g.lon, z, L, H);
-  const ctrl = new AbortController();
-  const minuterie = setTimeout(() => ctrl.abort(), C.delai_ms);
-  let images;
-  try {
-    images = await Promise.all(tuiles.map((t) => chargerTuile(urlTuile(z, t.x, t.y), ctrl.signal)));
-  } catch (e) {
-    ctrl.abort();
-    if (e && e.url) console.warn('[situation] tuile en échec :', e.url);
-    throw new Error(messageErreur(e));
-  } finally { clearTimeout(minuterie); }
-  const absentes = images.filter((im) => !im).length;
-  if (absentes === images.length) {
+  let z = Math.min(C.zoom_max, Math.max(dimensions ? 0 : C.zoom_min, Math.round(zoom ?? C.zoom_defaut)));
+  let L = dimensions ? Math.round(dimensions.largeurPx) : C.largeur_px, H = dimensions ? Math.round(dimensions.hauteurPx) : C.hauteur_px;
+  let tuiles, images, absentes;
+  for (let recul = 0; ; recul++) {
+    tuiles = tuilesFenetre(g.lat, g.lon, z, L, H);
+    const ctrl = new AbortController();
+    const minuterie = setTimeout(() => ctrl.abort(), C.delai_ms);
+    const refus = [];
+    try {
+      // v1.9.1 (H-380) : un 400 sur une tuile ne fait pas échouer les autres ; toute autre erreur annule l'ensemble
+      images = await Promise.all(tuiles.map((t) => chargerTuile(urlTuile(z, t.x, t.y), ctrl.signal).catch((e) => {
+        if (e && e.code === 'http' && e.status === 400) { refus.push(e); return null; }
+        throw e;
+      })));
+    } catch (e) {
+      ctrl.abort();
+      if (e && e.url) console.warn('[situation] tuile en échec :', e.url, e.detail || '');
+      throw new Error(messageErreur(e));
+    } finally { clearTimeout(minuterie); }
+    absentes = images.filter((im) => !im).length;
+    if (absentes < images.length) break;
+    if (refus.length) {
+      console.warn('[situation] toutes les tuiles refusées (400) au niveau ' + z + ' — exemple :', refus[0].url, refus[0].detail || '');
+      if (recul < RECULS_ZOOM_MAX && z - 1 >= ZOOM_RECUL_MIN) {
+        // même emprise au sol un niveau plus bas : moitié de pixels de chaque côté
+        z -= 1; L = Math.max(1, Math.round(L / 2)); H = Math.max(1, Math.round(H / 2));
+        continue;
+      }
+      throw new Error(messageErreur(refus[0]));
+    }
     console.warn('[situation] aucune tuile au niveau ' + z + ' autour de', g.lat, g.lon, '— exemple :', urlTuile(z, tuiles[0].x, tuiles[0].y));
     throw new Error('aucune carte IGN au point « ' + g.lat + ', ' + g.lon + ' » (hors couverture du Plan IGN) — vérifier le point GPS de l’affaire');
   }
@@ -189,5 +235,5 @@ export async function genererCarteSituation(gps, zoom = null, dimensions = null)
   c2.fillStyle = '#333333'; c2.textBaseline = 'bottom';
   c2.fillText(A.texte, L - lt - A.marge_px, H - A.marge_px);
   const blob = await new Promise((resolve, reject) => cv.toBlob((b) => (b ? resolve(b) : reject(new Error('encodage de la carte impossible'))), 'image/jpeg', C.qualite_jpeg));
-  return { blob, largeurPx: L, hauteurPx: H, nom_fichier: 'Plan de situation (IGN)', mime: 'image/jpeg', lat: g.lat, lon: g.lon, zoom: z, tuiles_absentes: absentes };
+  return { blob, largeurPx: L, hauteurPx: H, nom_fichier: 'Plan de situation (IGN)', mime: 'image/jpeg', lat: g.lat, lon: g.lon, zoom: z, tuiles_absentes: absentes, zoom_demande: Math.min(C.zoom_max, Math.max(dimensions ? 0 : C.zoom_min, Math.round(zoom ?? C.zoom_defaut))) };
 }
