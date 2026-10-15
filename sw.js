@@ -3,7 +3,7 @@
  * puis répond depuis le cache (cache-first). Incrémenter VERSION à chaque
  * livraison pour forcer le renouvellement du cache sur les tablettes.
  */
-const VERSION = 'reseaux-hc-v1.9.0';
+const VERSION = 'reseaux-hc-v1.9.1';
 
 const RESSOURCES = [
   './',
